@@ -138,6 +138,13 @@ def init_db():
           changed_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS pipeline_configs (
+          project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+          config_json TEXT NOT NULL,
+          updated_by INTEGER REFERENCES users(id),
+          updated_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS ix_assets_project
           ON assets(project_id, split, review_state);
 
@@ -279,6 +286,21 @@ def discover(root: Path):
                 image_dir.parent.name.lower() if image_dir.parent.name.lower() in ('train','val','valid','test') else 'unsplit')
             assets[key] = (key, label.relative_to(root).as_posix(), split)
     return sorted(assets.values())
+
+
+def discover_image_folder(root: Path):
+    """Import an arbitrary image-only folder and reserve label paths for inference."""
+    assets = []
+    for file in root.rglob('*'):
+        if not file.is_file() or file.suffix.lower() not in IMG_EXT:
+            continue
+        if not file.resolve().is_relative_to(root):
+            continue
+        image_rel = file.relative_to(root)
+        # Keep the relative hierarchy to avoid collisions between equal filenames.
+        label_rel = Path('labels') / 'inbox' / image_rel.with_suffix('.txt')
+        assets.append((image_rel.as_posix(), label_rel.as_posix(), 'inbox'))
+    return sorted(assets)
 
 
 def read_classes(root: Path, assets):
@@ -423,6 +445,7 @@ class MemberData(BaseModel):
 class ProjectData(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     dataset_path: str = Field(min_length=1, max_length=4096)
+    import_mode: str = 'labeled'
 
 
 class BoxData(BaseModel):
@@ -444,6 +467,10 @@ class InferData(BaseModel):
     asset_ids: list[int] = Field(default_factory=list)
     confidence: float = Field(default=0.25, ge=0.0, le=1.0)
     update_classes: bool = True
+
+
+class PipelineData(BaseModel):
+    config: dict[str, Any]
 
 
 app = FastAPI(title='YOLO Workspace Studio', docs_url=None, redoc_url=None)
@@ -618,12 +645,27 @@ def create_project(wid: int, data: ProjectData, request: Request):
             fail(403, 'Admin cần đặt YOLO_ALLOWED_ROOTS để manager import dataset')
         if not os.access(root, os.R_OK):
             fail(403, 'Server không có quyền đọc dataset')
-        assets = discover(root)
+        mode = data.import_mode.strip().lower()
+        if mode not in {'images', 'labeled', 'split'}:
+            fail(422, 'Loại import phải là images, labeled hoặc split')
+        assets = discover_image_folder(root) if mode == 'images' else discover(root)
         if not assets:
             fail(422, 'Không tìm thấy cấu trúc images/ và labels/ tương ứng')
         if len(assets)>500000:
             fail(422, 'Dataset vượt quá 500.000 ảnh/project')
-        classes = read_classes(root, assets)
+        if mode == 'labeled':
+            missing_labels = sum(not (root / label).is_file() for _, label, _ in assets)
+            if missing_labels:
+                fail(422, f'Dataset thiếu {missing_labels} file nhãn YOLO')
+        if mode == 'split':
+            splits = {'val' if split == 'valid' else split for _, _, split in assets}
+            missing = {'train', 'val', 'test'} - splits
+            if missing:
+                fail(422, f"Dataset còn thiếu split: {', '.join(sorted(missing))}")
+            missing_labels = sum(not (root / label).is_file() for _, label, _ in assets)
+            if missing_labels:
+                fail(422, f'Dataset split thiếu {missing_labels} file nhãn YOLO')
+        classes = [] if mode == 'images' else read_classes(root, assets)
         with db:
             cur = db.execute('INSERT INTO projects(workspace_id,name,dataset_root,classes_json,created_at) VALUES(?,?,?,?,?)',
                              (wid,data.name.strip(),str(root),json.dumps(classes,ensure_ascii=False),now()))
@@ -696,8 +738,89 @@ async def upload_project_model(pid: int, request: Request, model: UploadFile = F
     if size == 0:
         target.unlink(missing_ok=True)
         fail(422, 'File model trống')
+    try:
+        from ultralytics import YOLO
+        inspected = YOLO(str(target))
+        task = str(getattr(inspected, 'task', '') or '')
+        names = getattr(inspected, 'names', {})
+        classes = [str(names[i]) for i in sorted(names)] if isinstance(names, dict) else [str(x) for x in names]
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        fail(422, f'Không đọc được metadata model: {exc}')
+    model_id = f'mdl_{secrets.token_hex(6)}'
     print(f'[MODEL] uploaded project={pid} file={target} size={size}', flush=True)
-    return {'ok': True, 'name': original_name, 'model_path': str(target), 'size': size}
+    return {'ok': True, 'model_id': model_id, 'name': original_name,
+            'model_path': str(target), 'size': size, 'task': task, 'classes': classes}
+
+
+def validate_pipeline_config(config: dict[str, Any]) -> dict[str, Any]:
+    errors = []
+    detector = config.get('detector')
+    groups = config.get('classification_groups', [])
+    if not isinstance(detector, dict):
+        errors.append('Thiếu detector')
+    elif detector.get('type') != 'detection':
+        errors.append('detector.type phải là detection')
+    if not isinstance(groups, list):
+        errors.append('classification_groups phải là một danh sách')
+        groups = []
+    ids = []
+    if isinstance(detector, dict) and detector.get('id'):
+        ids.append(detector['id'])
+    classifier_count = 0
+    selected = list(detector.get('selected_classes', [])) if isinstance(detector, dict) else []
+    for group_index, group in enumerate(groups, 1):
+        classifiers = group.get('classifiers', []) if isinstance(group, dict) else []
+        if not isinstance(classifiers, list):
+            errors.append(f'Group #{group_index}: classifiers phải là danh sách')
+            continue
+        for classifier in classifiers:
+            classifier_count += 1
+            if classifier.get('type') != 'classification':
+                errors.append(f"{classifier.get('id', 'classifier')}: type phải là classification")
+            if classifier.get('id'):
+                ids.append(classifier['id'])
+            selected.extend(classifier.get('selected_classes', []))
+    if len(ids) != len(set(ids)):
+        errors.append('ID model/stage không được trùng nhau')
+    final_classes = config.get('output', {}).get('class_order') or list(dict.fromkeys(selected))
+    return {'valid': not errors, 'errors': errors,
+            'model_count': (1 if detector else 0) + classifier_count,
+            'detector_count': 1 if detector else 0,
+            'classifier_count': classifier_count, 'final_classes': final_classes}
+
+
+@app.get('/api/projects/{pid}/pipeline')
+def get_pipeline(pid: int, request: Request):
+    with db_connect() as db:
+        user = require_user(request, db)
+        project_access(db, user, pid)
+        row = db.execute('SELECT config_json,updated_at FROM pipeline_configs WHERE project_id=?', (pid,)).fetchone()
+        return {'config': json.loads(row['config_json']), 'updated_at': row['updated_at']} if row else {'config': None}
+
+
+@app.put('/api/projects/{pid}/pipeline')
+def save_pipeline(pid: int, data: PipelineData, request: Request):
+    report = validate_pipeline_config(data.config)
+    if not report['valid']:
+        fail(422, '; '.join(report['errors']))
+    with db_connect() as db:
+        user = require_user(request, db)
+        project_access(db, user, pid, 'editor')
+        db.execute('''INSERT INTO pipeline_configs(project_id,config_json,updated_by,updated_at)
+                      VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET
+                      config_json=excluded.config_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at''',
+                   (pid, json.dumps(data.config, ensure_ascii=False), user['id'], now()))
+        db.commit()
+    return {'ok': True, **report}
+
+
+@app.post('/api/projects/{pid}/pipeline/validate')
+def validate_pipeline(pid: int, data: PipelineData, request: Request):
+    with db_connect() as db:
+        user = require_user(request, db)
+        project_access(db, user, pid)
+    return validate_pipeline_config(data.config)
 
 
 @app.post('/api/projects/{pid}/infer')
