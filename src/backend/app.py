@@ -34,6 +34,7 @@ FRONTEND_DIR = HERE / 'src' / 'frontend'
 DATA_DIR = Path(os.environ.get('YOLO_STUDIO_DATA', str(HERE / '.studio_data'))).expanduser().resolve()
 DB_PATH = DATA_DIR / 'workspace.db'
 IMG_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
+LABEL_PALETTE = ['#45d8bd','#a393ff','#ffc26c','#67abff','#ff7697','#bef477','#faadfa','#4ad4ef']
 LEASE_SECONDS = 180
 SESSION_SECONDS = 60 * 60 * 24 * 7
 SECURE_COOKIES = os.environ.get('YOLO_SECURE_COOKIE', '').lower() in ('1', 'true', 'yes')
@@ -171,6 +172,18 @@ def init_db():
                 'ADD COLUMN reviewed_at INTEGER'
             )
 
+        if 'assigned_to' not in cols:
+            db.execute(
+                'ALTER TABLE assets '
+                'ADD COLUMN assigned_to INTEGER REFERENCES users(id)'
+            )
+
+        project_cols = {row['name'] for row in db.execute('PRAGMA table_info(projects)')}
+        if 'class_colors_json' not in project_cols:
+            db.execute("ALTER TABLE projects ADD COLUMN class_colors_json TEXT NOT NULL DEFAULT '[]'")
+        if 'cover_asset_id' not in project_cols:
+            db.execute('ALTER TABLE projects ADD COLUMN cover_asset_id INTEGER')
+
 
 def password_hash(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -288,18 +301,28 @@ def discover(root: Path):
     return sorted(assets.values())
 
 
-def discover_image_folder(root: Path):
+def discover_image_folder(root: Path, image_dir: Path | None = None):
     """Import an arbitrary image-only folder and reserve label paths for inference."""
+    image_dir = image_dir or root
     assets = []
-    for file in root.rglob('*'):
+    for file in image_dir.rglob('*'):
         if not file.is_file() or file.suffix.lower() not in IMG_EXT:
             continue
         if not file.resolve().is_relative_to(root):
             continue
         image_rel = file.relative_to(root)
-        # Keep the relative hierarchy to avoid collisions between equal filenames.
-        label_rel = Path('labels') / 'inbox' / image_rel.with_suffix('.txt')
-        assets.append((image_rel.as_posix(), label_rel.as_posix(), 'inbox'))
+        parts = list(image_rel.parts)
+        image_positions = [i for i, part in enumerate(parts[:-1]) if part.lower() == 'images']
+        if image_positions:
+            parts[image_positions[-1]] = 'labels'
+            label_rel = Path(*parts).with_suffix('.txt')
+        else:
+            # Keep the relative hierarchy to avoid collisions between equal filenames.
+            label_rel = Path('labels') / 'inbox' / image_rel.with_suffix('.txt')
+        split = next((part.lower() for part in image_rel.parts if part.lower() in ('train', 'val', 'valid', 'test')), 'inbox')
+        if split == 'inbox' and image_dir.name.lower() == 'images' and image_dir.parent.name.lower() in ('train', 'val', 'valid', 'test'):
+            split = image_dir.parent.name.lower()
+        assets.append((image_rel.as_posix(), label_rel.as_posix(), split))
     return sorted(assets)
 
 
@@ -397,7 +420,21 @@ def image_and_label_paths(project, asset):
         parts[positions[-1]] = 'labels'
         label_rel = Path(*parts).with_suffix('.txt')
 
-    label_path = inside(root, root / label_rel)
+    # Compatibility for image-only projects imported with the image directory
+    # itself as dataset_root. Keep labels as a sibling of images.
+    label_parts = list(label_rel.parts)
+    if len(label_parts) >= 3 and [x.lower() for x in label_parts[:2]] == ['labels', 'inbox']:
+        relative_label = Path(*label_parts[2:])
+        if root.name.lower() == 'images':                 # train/images
+            label_root = root.parent / 'labels'
+            label_path = inside(root.parent, label_root / relative_label)
+        elif root.parent.name.lower() == 'images' and root.name.lower() in ('train', 'val', 'valid', 'test'):
+            label_root = root.parent.parent / 'labels' / root.name  # images/train
+            label_path = inside(root.parent.parent, label_root / relative_label)
+        else:
+            label_path = inside(root, root / label_rel)
+    else:
+        label_path = inside(root, root / label_rel)
 
     if label_path.is_dir():
         raise ValueError(
@@ -415,11 +452,14 @@ def asset_dict(db, row):
         locker = {'id': row['locked_by'], 'name': r['display_name'] if r else '?', 'until': row['lock_until']}
     rev_user=db.execute('SELECT display_name FROM users WHERE id=?',(row['reviewed_by'],)).fetchone() if row['reviewed_by'] else None
     last_user=db.execute('SELECT display_name FROM users WHERE id=?',(row['updated_by'],)).fetchone() if row['updated_by'] else None
+    assigned_user=db.execute('SELECT display_name FROM users WHERE id=?',(row['assigned_to'],)).fetchone() if row['assigned_to'] else None
     return {'id': row['id'], 'image_rel': row['image_rel'], 'split': row['split'],
             'has_label': bool(row['label_rel']), 'revision': row['revision'],
             'state': row['review_state'], 'lock': locker, 'updated_at': row['updated_at'],
             'updated_by': last_user['display_name'] if last_user else None,
-            'reviewed_by': rev_user['display_name'] if rev_user else None, 'reviewed_at': row['reviewed_at']}
+            'reviewed_by': rev_user['display_name'] if rev_user else None, 'reviewed_at': row['reviewed_at'],
+            'assigned_to_id': row['assigned_to'],
+            'assigned_to': assigned_user['display_name'] if assigned_user else None}
 
 
 class LoginData(BaseModel):
@@ -473,7 +513,28 @@ class PipelineData(BaseModel):
     config: dict[str, Any]
 
 
+class PipelineRunData(BaseModel):
+    overwrite: bool = False
+
+
+class LabelItem(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    color: str = Field(pattern=r'^#[0-9a-fA-F]{6}$')
+
+
+class LabelsData(BaseModel):
+    labels: list[LabelItem] = Field(min_length=1, max_length=10000)
+
+
+class AssignmentData(BaseModel):
+    member_ids: list[int] = Field(min_length=1, max_length=100)
+    split: str = ''
+    state: str = ''
+    only_unassigned: bool = True
+
+
 app = FastAPI(title='YOLO Workspace Studio', docs_url=None, redoc_url=None)
+PIPELINE_PROGRESS: dict[int, dict[str, Any]] = {}
 init_db()
 app.mount('/static', StaticFiles(directory=str(FRONTEND_DIR)), name='static')
 
@@ -628,7 +689,11 @@ def list_projects(wid: int, request: Request):
                WHERE p.workspace_id=? GROUP BY p.id ORDER BY p.id DESC''', (wid,)).fetchall()
         return [{'id': r['id'], 'workspace_id': r['workspace_id'], 'name': r['name'],
                  'dataset_root': r['dataset_root'], 'total': r['total'] or 0,
-                 'reviewed': r['reviewed'] or 0, 'classes': json.loads(r['classes_json'])} for r in rows]
+                 'reviewed': r['reviewed'] or 0, 'classes': json.loads(r['classes_json']),
+                 'class_colors': project_class_colors(r),
+                 'cover_asset_id': r['cover_asset_id'] or db.execute(
+                     'SELECT MIN(id) FROM assets WHERE project_id=?', (r['id'],)
+                 ).fetchone()[0]} for r in rows]
 
 
 @app.post('/api/workspaces/{wid}/projects')
@@ -648,7 +713,15 @@ def create_project(wid: int, data: ProjectData, request: Request):
         mode = data.import_mode.strip().lower()
         if mode not in {'images', 'labeled', 'split'}:
             fail(422, 'Loại import phải là images, labeled hoặc split')
-        assets = discover_image_folder(root) if mode == 'images' else discover(root)
+        image_dir = root
+        if mode == 'images' and root.name.lower() == 'images':
+            # train/images -> root=train and labels go to train/labels.
+            root = root.parent
+        elif (mode == 'images' and root.parent.name.lower() == 'images'
+              and root.name.lower() in ('train', 'val', 'valid', 'test')):
+            # images/train -> root=dataset and labels go to labels/train.
+            root = root.parent.parent
+        assets = discover_image_folder(root, image_dir) if mode == 'images' else discover(root)
         if not assets:
             fail(422, 'Không tìm thấy cấu trúc images/ và labels/ tương ứng')
         if len(assets)>500000:
@@ -790,6 +863,20 @@ def validate_pipeline_config(config: dict[str, Any]) -> dict[str, Any]:
             'classifier_count': classifier_count, 'final_classes': final_classes}
 
 
+def normalize_label(value: Any) -> str:
+    return re.sub(r'[^a-z0-9]+', '_', str(value).strip().lower()).strip('_')
+
+
+def project_class_colors(project, classes: list[str] | None = None) -> list[str]:
+    classes = classes if classes is not None else json.loads(project['classes_json'])
+    try:
+        saved = json.loads(project['class_colors_json'] or '[]')
+    except (KeyError, TypeError, json.JSONDecodeError):
+        saved = []
+    return [saved[i] if i < len(saved) and re.fullmatch(r'#[0-9a-fA-F]{6}', str(saved[i]))
+            else LABEL_PALETTE[i % len(LABEL_PALETTE)] for i in range(len(classes))]
+
+
 @app.get('/api/projects/{pid}/pipeline')
 def get_pipeline(pid: int, request: Request):
     with db_connect() as db:
@@ -821,6 +908,135 @@ def validate_pipeline(pid: int, data: PipelineData, request: Request):
         user = require_user(request, db)
         project_access(db, user, pid)
     return validate_pipeline_config(data.config)
+
+
+@app.post('/api/projects/{pid}/pipeline/run')
+def run_pipeline(pid: int, data: PipelineRunData, request: Request):
+    """Run one detector and parallel classifiers, then write final YOLO labels."""
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        fail(503, 'Chưa cài Ultralytics')
+    with db_connect() as db:
+        user = require_user(request, db)
+        project, _ = project_access(db, user, pid, 'editor')
+        stored = db.execute('SELECT config_json FROM pipeline_configs WHERE project_id=?', (pid,)).fetchone()
+        if not stored:
+            fail(404, 'Project chưa có pipeline')
+        config = json.loads(stored['config_json'])
+        report = validate_pipeline_config(config)
+        if not report['valid']:
+            fail(422, '; '.join(report['errors']))
+        detector_cfg = config['detector']
+        detector_path = Path(detector_cfg.get('model', {}).get('path', '')).resolve()
+        if not detector_path.is_file():
+            fail(422, 'Pipeline chưa gắn file model detection')
+        detector = YOLO(str(detector_path))
+        detector_names = detector.names
+        selected_detection = {
+            normalize_label(name): str(name)
+            for name in detector_cfg.get('selected_classes', [])
+        }
+        groups = config.get('classification_groups', [])
+        loaded_groups = []
+        for group in groups:
+            loaded = []
+            for cfg in group.get('classifiers', []):
+                path = Path(cfg.get('model', {}).get('path', '')).resolve()
+                if not path.is_file():
+                    fail(422, f"Classifier {cfg.get('id')} chưa gắn model")
+                loaded.append((cfg, YOLO(str(path))))
+            loaded_groups.append((group, loaded))
+        final_classes = report['final_classes']
+        final_ids = {name: index for index, name in enumerate(final_classes)}
+        priority = config.get('resolution', {}).get('priority', [])
+        rows = db.execute('SELECT * FROM assets WHERE project_id=? ORDER BY id', (pid,)).fetchall()
+        completed = skipped = box_total = 0
+        label_directories = [str(image_and_label_paths(project, row)[1].parent) for row in rows]
+        labels_root = os.path.commonpath(label_directories) if label_directories else str(Path(project['dataset_root']) / 'labels')
+        PIPELINE_PROGRESS[pid] = {'status': 'running', 'processed': 0, 'total': len(rows),
+                                  'images': 0, 'skipped': 0, 'boxes': 0,
+                                  'current': '', 'labels_root': labels_root}
+        print(f'[PIPELINE] project={pid} images={len(rows)} models={report["model_count"]}', flush=True)
+        for row_index, row in enumerate(rows, 1):
+            image_path, label_path = image_and_label_paths(project, row)
+            PIPELINE_PROGRESS[pid].update(processed=row_index - 1, current=row['image_rel'])
+            if label_path.exists() and label_path.stat().st_size and not data.overwrite:
+                skipped += 1
+                PIPELINE_PROGRESS[pid].update(processed=row_index, skipped=skipped)
+                continue
+            prediction = detector.predict(str(image_path), conf=float(detector_cfg.get('confidence', .25)), verbose=False)[0]
+            width, height = prediction.orig_shape[1], prediction.orig_shape[0]
+            source_image = None
+            lines = []
+            for box in prediction.boxes:
+                detector_id = int(box.cls.item())
+                raw_detector_name = str(detector_names[detector_id] if isinstance(detector_names, dict) else detector_names[detector_id])
+                detector_name = selected_detection.get(normalize_label(raw_detector_name))
+                if detector_name is None:
+                    continue
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                matched = {}
+                for group, classifiers in loaded_groups:
+                    if normalize_label(group.get('input', {}).get('class')) != normalize_label(detector_name):
+                        continue
+                    if source_image is None:
+                        source_image = Image.open(image_path).convert('RGB')
+                    crop = source_image.crop((max(0, int(x1)), max(0, int(y1)), min(width, int(x2)), min(height, int(y2))))
+                    for classifier_cfg, classifier in classifiers:
+                        result = classifier.predict(crop, verbose=False)[0]
+                        if result.probs is None:
+                            continue
+                        class_id = int(result.probs.top1)
+                        confidence = float(result.probs.top1conf.item())
+                        names = classifier.names
+                        name = str(names[class_id] if isinstance(names, dict) else names[class_id])
+                        selected_outputs = {normalize_label(x): str(x) for x in classifier_cfg.get('selected_classes', [])}
+                        configured_name = selected_outputs.get(normalize_label(name))
+                        if configured_name and confidence >= float(classifier_cfg.get('confidence', .5)):
+                            matched[configured_name] = confidence
+                final_name = next((name for name in priority if name in matched), detector_name)
+                if final_name not in final_ids:
+                    final_name = detector_name
+                if final_name not in final_ids:
+                    # A selected detector bbox must never disappear because a
+                    # classifier mapping is incomplete.
+                    final_ids[final_name] = len(final_classes)
+                    final_classes.append(final_name)
+                x=(x1+x2)/(2*width); y=(y1+y2)/(2*height); w=(x2-x1)/width; h=(y2-y1)/height
+                lines.append(f'{final_ids[final_name]} {x:.8f} {y:.8f} {w:.8f} {h:.8f}')
+            if source_image is not None:
+                source_image.close()
+            label_path.parent.mkdir(parents=True, exist_ok=True)
+            label_path.write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
+            completed += 1
+            box_total += len(lines)
+            PIPELINE_PROGRESS[pid].update(processed=row_index, images=completed,
+                                          skipped=skipped, boxes=box_total,
+                                          last_label=str(label_path))
+        old_classes = json.loads(project['classes_json'])
+        old_colors = project_class_colors(project, old_classes)
+        color_by_name = dict(zip(old_classes, old_colors))
+        final_colors = [color_by_name.get(name, LABEL_PALETTE[i % len(LABEL_PALETTE)])
+                        for i, name in enumerate(final_classes)]
+        db.execute('UPDATE projects SET classes_json=?,class_colors_json=? WHERE id=?',
+                   (json.dumps(final_classes, ensure_ascii=False), json.dumps(final_colors), pid))
+        db.commit()
+        PIPELINE_PROGRESS[pid].update(status='completed', processed=len(rows), images=completed,
+                                      skipped=skipped, boxes=box_total, current='')
+        print(f'[PIPELINE] completed={completed} skipped={skipped} boxes={box_total}', flush=True)
+        return {'ok': True, 'images': completed, 'skipped': skipped, 'boxes': box_total,
+                'classes': final_classes, 'labels_root': PIPELINE_PROGRESS[pid]['labels_root']}
+
+
+@app.get('/api/projects/{pid}/pipeline/status')
+def pipeline_status(pid: int, request: Request):
+    with db_connect() as db:
+        user = require_user(request, db)
+        project, _ = project_access(db, user, pid)
+    return PIPELINE_PROGRESS.get(pid, {'status': 'idle', 'processed': 0, 'total': 0,
+                                       'images': 0, 'skipped': 0, 'boxes': 0,
+                                       'labels_root': str(Path(project['dataset_root']) / 'labels')})
 
 
 @app.post('/api/projects/{pid}/infer')
@@ -857,7 +1073,13 @@ def infer_project(pid: int, data: InferData, request: Request):
             label.parent.mkdir(parents=True, exist_ok=True); label.write_text('\n'.join(lines)+ ('\n' if lines else ''), encoding='utf-8')
             results.append({'asset_id': row['id'], 'boxes': len(lines)})
         if data.update_classes:
-            db.execute('UPDATE projects SET classes_json=? WHERE id=?', (json.dumps(class_names, ensure_ascii=False), pid))
+            old_classes = json.loads(project['classes_json'])
+            old_colors = project_class_colors(project, old_classes)
+            color_by_name = dict(zip(old_classes, old_colors))
+            colors = [color_by_name.get(name, LABEL_PALETTE[i % len(LABEL_PALETTE)])
+                      for i, name in enumerate(class_names)]
+            db.execute('UPDATE projects SET classes_json=?,class_colors_json=? WHERE id=?',
+                       (json.dumps(class_names, ensure_ascii=False), json.dumps(colors), pid))
         db.commit()
         print(f'[INFER] completed project={pid} results={len(results)} classes={class_names}', flush=True)
         return {'ok': True, 'classes': class_names, 'results': results}
@@ -871,7 +1093,40 @@ def project_meta(pid: int, request: Request):
         total = db.execute('SELECT count(*) FROM assets WHERE project_id=?',(pid,)).fetchone()[0]
         return {'id':p['id'],'name':p['name'],'workspace_id':p['workspace_id'],
                 'dataset_root':p['dataset_root'],'classes':json.loads(p['classes_json']),
-                'role':role, 'total':total}
+                'class_colors':project_class_colors(p),
+                'cover_asset_id':p['cover_asset_id'] or db.execute(
+                    'SELECT MIN(id) FROM assets WHERE project_id=?', (pid,)
+                ).fetchone()[0], 'role':role, 'total':total}
+
+
+@app.put('/api/projects/{pid}/cover/{aid}')
+def update_project_cover(pid: int, aid: int, request: Request):
+    with db_connect() as db:
+        user = require_user(request, db)
+        project_access(db, user, pid, 'editor')
+        asset = db.execute(
+            'SELECT id FROM assets WHERE id=? AND project_id=?', (aid, pid)
+        ).fetchone()
+        if not asset:
+            fail(404, 'Ảnh không thuộc dataset này')
+        db.execute('UPDATE projects SET cover_asset_id=? WHERE id=?', (aid, pid))
+        db.commit()
+    return {'ok': True, 'cover_asset_id': aid}
+
+
+@app.put('/api/projects/{pid}/labels')
+def update_project_labels(pid: int, data: LabelsData, request: Request):
+    names = [item.name.strip() for item in data.labels]
+    if len(names) != len(set(names)):
+        fail(422, 'Tên nhãn không được trùng nhau')
+    colors = [item.color.lower() for item in data.labels]
+    with db_connect() as db:
+        user = require_user(request, db)
+        project_access(db, user, pid, 'editor')
+        db.execute('UPDATE projects SET classes_json=?,class_colors_json=? WHERE id=?',
+                   (json.dumps(names, ensure_ascii=False), json.dumps(colors), pid))
+        db.commit()
+    return {'ok': True, 'classes': names, 'class_colors': colors}
 
 
 @app.get('/api/projects/{pid}/stats')
@@ -925,26 +1180,107 @@ def project_quality(pid: int, request: Request):
 
 @app.get('/api/projects/{pid}/export')
 def export_project(pid: int, request: Request):
-    """Export the current project as a YOLO ZIP without changing originals."""
+    """Export images, YOLO labels, data.yaml and a complete JSON manifest."""
     with db_connect() as db:
         u = require_user(request, db)
         p, _ = project_access(db, u, pid)
-        root = Path(p['dataset_root']).resolve()
         classes = json.loads(p['classes_json'])
+        colors = project_class_colors(p)
+        rows = db.execute(
+            'SELECT * FROM assets WHERE project_id=? ORDER BY image_rel', (pid,)
+        ).fetchall()
+        users = {
+            row['id']: row['display_name']
+            for row in db.execute('SELECT id,display_name FROM users')
+        }
+        manifest = {
+            'schema_version': '1.0',
+            'format': 'yolo_detection',
+            'project': {'id': p['id'], 'name': p['name']},
+            'classes': [
+                {'id': index, 'name': name, 'color': colors[index]}
+                for index, name in enumerate(classes)
+            ],
+            'image_count': len(rows),
+            'images': [],
+        }
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
-            for row in db.execute('SELECT image_rel,label_rel FROM assets WHERE project_id=?', (pid,)):
+            for row in rows:
                 image, label = image_and_label_paths(p, row)
-                if image.exists(): z.write(image, row['image_rel'])
-                if label.exists(): z.write(label, row['label_rel'])
+                width = height = None
+                image_error = None
+                if image.exists():
+                    z.write(image, row['image_rel'])
+                    try:
+                        with Image.open(image) as im:
+                            im = ImageOps.exif_transpose(im)
+                            width, height = im.size
+                    except (OSError, ValueError) as exc:
+                        image_error = str(exc)
+                else:
+                    image_error = 'missing image file'
+                if label.exists():
+                    z.write(label, row['label_rel'])
+                annotation_error = None
+                boxes = []
+                try:
+                    parsed = parse_labels(label, len(classes))
+                    for box_index, box in enumerate(parsed, 1):
+                        x, y, w, h = box['x'], box['y'], box['w'], box['h']
+                        pixel = None
+                        if width is not None and height is not None:
+                            pixel = {
+                                'x_center': x * width,
+                                'y_center': y * height,
+                                'width': w * width,
+                                'height': h * height,
+                                'x_min': (x - w / 2) * width,
+                                'y_min': (y - h / 2) * height,
+                                'x_max': (x + w / 2) * width,
+                                'y_max': (y + h / 2) * height,
+                            }
+                        boxes.append({
+                            'index': box_index,
+                            'class_id': box['cls'],
+                            'class_name': classes[box['cls']],
+                            'color': colors[box['cls']],
+                            'yolo': {'x_center': x, 'y_center': y, 'width': w, 'height': h},
+                            'pixel': pixel,
+                        })
+                except Exception as exc:
+                    annotation_error = getattr(exc, 'detail', None) or str(exc)
+                manifest['images'].append({
+                    'id': row['id'],
+                    'image': row['image_rel'],
+                    'label': row['label_rel'],
+                    'split': row['split'],
+                    'width': width,
+                    'height': height,
+                    'revision': row['revision'],
+                    'review_state': row['review_state'],
+                    'updated_by': users.get(row['updated_by']),
+                    'updated_at': row['updated_at'],
+                    'reviewed_by': users.get(row['reviewed_by']),
+                    'reviewed_at': row['reviewed_at'],
+                    'assigned_to': users.get(row['assigned_to']),
+                    'boxes': boxes,
+                    'image_error': image_error,
+                    'annotation_error': annotation_error,
+                })
             data = {'path': '.', 'train': 'images/train', 'val': 'images/val', 'test': 'images/test', 'names': {i: name for i, name in enumerate(classes)}}
             z.writestr('data.yaml', yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+            z.writestr(
+                'annotations.json',
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
         buf.seek(0)
         return StreamingResponse(iter([buf.getvalue()]), media_type='application/zip', headers={'Content-Disposition': f'attachment; filename="yolo_project_{pid}.zip"'})
 
 
 @app.get('/api/projects/{pid}/assets')
-def assets(pid:int, request:Request, q:str='',split:str='',state:str='', page:int=1,limit:int=48):
+def assets(pid:int, request:Request, q:str='',split:str='',state:str='', annotated_by:int=0,
+           assigned_to:int=0, page:int=1,limit:int=48):
     with db_connect() as db:
         u=require_user(request,db);project_access(db,u,pid)
         page=max(1,page);limit=max(1,min(limit,200))
@@ -956,10 +1292,50 @@ def assets(pid:int, request:Request, q:str='',split:str='',state:str='', page:in
             cond+=' AND split=?'; vals.append(split)
         if state:
             cond+=' AND review_state=?'; vals.append(state)
+        if annotated_by:
+            cond+=' AND (updated_by=? OR reviewed_by=?)'; vals.extend([annotated_by, annotated_by])
+        if assigned_to == -1:
+            cond+=' AND assigned_to IS NULL'
+        elif assigned_to:
+            cond+=' AND assigned_to=?'; vals.append(assigned_to)
         total=db.execute(f'SELECT count(*) FROM assets WHERE {cond}',vals).fetchone()[0]
         rows=db.execute(f'SELECT * FROM assets WHERE {cond} ORDER BY image_rel LIMIT ? OFFSET ?',
                         [*vals,limit,(page-1)*limit]).fetchall()
         return {'total':total,'page':page,'items':[asset_dict(db,row) for row in rows]}
+
+
+@app.post('/api/projects/{pid}/assignments/distribute')
+def distribute_assignments(pid: int, data: AssignmentData, request: Request):
+    with db_connect() as db:
+        user = require_user(request, db)
+        project, _ = project_access(db, user, pid, 'manager')
+        member_ids = list(dict.fromkeys(data.member_ids))
+        placeholders = ','.join('?' for _ in member_ids)
+        members = db.execute(
+            f'''SELECT user_id FROM members WHERE workspace_id=?
+                AND user_id IN ({placeholders}) AND role IN ('owner','manager','editor')''',
+            [project['workspace_id'], *member_ids]
+        ).fetchall()
+        if len(members) != len(member_ids):
+            fail(422, 'Có thành viên không thuộc workspace hoặc không có quyền gán nhãn')
+        cond = 'project_id=?'
+        vals = [pid]
+        if data.split:
+            cond += ' AND split=?'; vals.append(data.split)
+        if data.state:
+            if data.state not in ('todo', 'in_progress', 'reviewed'):
+                fail(422, 'Trạng thái không hợp lệ')
+            cond += ' AND review_state=?'; vals.append(data.state)
+        if data.only_unassigned:
+            cond += ' AND assigned_to IS NULL'
+        rows = db.execute(f'SELECT id FROM assets WHERE {cond} ORDER BY image_rel', vals).fetchall()
+        counts = {member_id: 0 for member_id in member_ids}
+        for index, row in enumerate(rows):
+            member_id = member_ids[index % len(member_ids)]
+            db.execute('UPDATE assets SET assigned_to=? WHERE id=?', (member_id, row['id']))
+            counts[member_id] += 1
+        db.commit()
+        return {'ok': True, 'assigned': len(rows), 'counts': counts}
 
 
 @app.get('/api/projects/{pid}/assets/{aid}')
