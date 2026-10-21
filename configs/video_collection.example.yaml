@@ -1,0 +1,85 @@
+output_dir: D:/SDS/pipeline_training/collected_classrooms
+device: 0
+max_parallel_cameras: 2  # tăng dần sau khi đo VRAM; 8 model song song có thể hết bộ nhớ
+
+pipeline:
+  model_version: human-behavior-v1
+  detector:
+    model: D:/models/human_detection.pt
+    confidence: 0.20
+    selected_classes: [head, visible_person]
+  person_classes: [visible_person]
+  classification_groups:
+    - input_class: visible_person
+      classifiers:
+        - id: sleep
+          model: D:/models/sleep_classifier.pt
+          confidence: 0.40
+          selected_classes: [sleep]
+        - id: raisehand
+          model: D:/models/raisehand_classifier.pt
+          confidence: 0.40
+          selected_classes: [raisehand]
+        # Thêm classifier phone/tired tại đây.
+  resolution:
+    priority: [phone, raisehand, sleep]
+  class_order: [head, visible_person, sleep, raisehand, phone]
+
+defaults:
+  live: true
+  reconnect: true
+  reconnect_delay_s: 3
+  inference_stride: 1
+  jpeg_quality: 92
+  event:
+    behaviors: [raisehand, sleep, phone]
+    behavior_confidence: 0.35
+    minimum_positive_frames: 5
+    iou_threshold: 0.4
+    ttl_s: 10
+    candidate_reset_s: 1.0
+    neighbor_seconds: 1  # metadata hiện để []; chưa ghi frame lân cận
+  periodic:
+    interval_s: 30
+    buffer_size: 5
+    image_metric: distance  # lớn hơn = khác hơn; lưu khi >= threshold
+    image_distance_threshold: 0.12
+    layout_distance_threshold: 0.45
+    person_count_change: 2
+    signature_size: [160, 90]
+  unfiltered:
+    interval_s: 180
+
+cameras:
+  - id: class_01
+    source: rtsp://user:password@192.168.1.101/stream
+  - id: class_02
+    source: rtsp://user:password@192.168.1.102/stream
+  # Có thể override ngưỡng theo camera:
+  - id: class_03
+    source: D:/videos/class_03.mp4
+    live: false
+    reconnect: false
+    event:
+      behaviors: [raisehand, sleep, phone]
+      behavior_confidence: 0.30
+      minimum_positive_frames: 5
+      iou_threshold: 0.35
+      ttl_s: 8
+      candidate_reset_s: 1.0
+      neighbor_seconds: 1
+    periodic:
+      interval_s: 30
+      buffer_size: 5
+      image_metric: distance
+      image_distance_threshold: 0.10
+      layout_distance_threshold: 0.40
+      person_count_change: 2
+      signature_size: [160, 90]
+    unfiltered:
+      interval_s: 180
+  - {id: class_04, source: 'rtsp://user:password@192.168.1.104/stream'}
+  - {id: class_05, source: 'rtsp://user:password@192.168.1.105/stream'}
+  - {id: class_06, source: 'rtsp://user:password@192.168.1.106/stream'}
+  - {id: class_07, source: 'rtsp://user:password@192.168.1.107/stream'}
+  - {id: class_08, source: 'rtsp://user:password@192.168.1.108/stream'}

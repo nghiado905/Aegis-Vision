@@ -1180,20 +1180,100 @@ def project_quality(pid: int, request: Request):
 
 @app.get('/api/projects/{pid}/export')
 def export_project(pid: int, request: Request):
-    """Export the current project as a YOLO ZIP without changing originals."""
+    """Export images, YOLO labels, data.yaml and a complete JSON manifest."""
     with db_connect() as db:
         u = require_user(request, db)
         p, _ = project_access(db, u, pid)
-        root = Path(p['dataset_root']).resolve()
         classes = json.loads(p['classes_json'])
+        colors = project_class_colors(p)
+        rows = db.execute(
+            'SELECT * FROM assets WHERE project_id=? ORDER BY image_rel', (pid,)
+        ).fetchall()
+        users = {
+            row['id']: row['display_name']
+            for row in db.execute('SELECT id,display_name FROM users')
+        }
+        manifest = {
+            'schema_version': '1.0',
+            'format': 'yolo_detection',
+            'project': {'id': p['id'], 'name': p['name']},
+            'classes': [
+                {'id': index, 'name': name, 'color': colors[index]}
+                for index, name in enumerate(classes)
+            ],
+            'image_count': len(rows),
+            'images': [],
+        }
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
-            for row in db.execute('SELECT image_rel,label_rel FROM assets WHERE project_id=?', (pid,)):
+            for row in rows:
                 image, label = image_and_label_paths(p, row)
-                if image.exists(): z.write(image, row['image_rel'])
-                if label.exists(): z.write(label, row['label_rel'])
+                width = height = None
+                image_error = None
+                if image.exists():
+                    z.write(image, row['image_rel'])
+                    try:
+                        with Image.open(image) as im:
+                            im = ImageOps.exif_transpose(im)
+                            width, height = im.size
+                    except (OSError, ValueError) as exc:
+                        image_error = str(exc)
+                else:
+                    image_error = 'missing image file'
+                if label.exists():
+                    z.write(label, row['label_rel'])
+                annotation_error = None
+                boxes = []
+                try:
+                    parsed = parse_labels(label, len(classes))
+                    for box_index, box in enumerate(parsed, 1):
+                        x, y, w, h = box['x'], box['y'], box['w'], box['h']
+                        pixel = None
+                        if width is not None and height is not None:
+                            pixel = {
+                                'x_center': x * width,
+                                'y_center': y * height,
+                                'width': w * width,
+                                'height': h * height,
+                                'x_min': (x - w / 2) * width,
+                                'y_min': (y - h / 2) * height,
+                                'x_max': (x + w / 2) * width,
+                                'y_max': (y + h / 2) * height,
+                            }
+                        boxes.append({
+                            'index': box_index,
+                            'class_id': box['cls'],
+                            'class_name': classes[box['cls']],
+                            'color': colors[box['cls']],
+                            'yolo': {'x_center': x, 'y_center': y, 'width': w, 'height': h},
+                            'pixel': pixel,
+                        })
+                except Exception as exc:
+                    annotation_error = getattr(exc, 'detail', None) or str(exc)
+                manifest['images'].append({
+                    'id': row['id'],
+                    'image': row['image_rel'],
+                    'label': row['label_rel'],
+                    'split': row['split'],
+                    'width': width,
+                    'height': height,
+                    'revision': row['revision'],
+                    'review_state': row['review_state'],
+                    'updated_by': users.get(row['updated_by']),
+                    'updated_at': row['updated_at'],
+                    'reviewed_by': users.get(row['reviewed_by']),
+                    'reviewed_at': row['reviewed_at'],
+                    'assigned_to': users.get(row['assigned_to']),
+                    'boxes': boxes,
+                    'image_error': image_error,
+                    'annotation_error': annotation_error,
+                })
             data = {'path': '.', 'train': 'images/train', 'val': 'images/val', 'test': 'images/test', 'names': {i: name for i, name in enumerate(classes)}}
             z.writestr('data.yaml', yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+            z.writestr(
+                'annotations.json',
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
         buf.seek(0)
         return StreamingResponse(iter([buf.getvalue()]), media_type='application/zip', headers={'Content-Disposition': f'attachment; filename="yolo_project_{pid}.zip"'})
 
