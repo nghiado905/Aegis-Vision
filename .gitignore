@@ -1,0 +1,38 @@
+# Python cache / test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime state
+.studio_data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+
+# Temporary and editor files
+*.tmp
+*.bak
+*.swp
+.vscode/
+.idea/
+
+# Generated exports / local model files
+exports/
+export_*.zip
+*.pt
+*.onnx
+*.engine
+
+# Local uploaded/generated dataset content
+uploads/
+inbox/
+visualized/
