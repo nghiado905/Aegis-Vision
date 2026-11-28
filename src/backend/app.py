@@ -563,7 +563,7 @@ class ProjectData(BaseModel):
     dataset_path: str = Field(default='', max_length=4096)
     image_path: str = Field(default='', max_length=4096)
     label_path: str = Field(default='', max_length=4096)
-    import_mode: str = 'labeled'
+    import_mode: str = 'auto'
 
 
 class BoxData(BaseModel):
@@ -634,6 +634,7 @@ class AssignmentData(BaseModel):
     split: str = ''
     state: str = ''
     only_unassigned: bool = True
+    percentages: list[float] | None = None
 
 
 app = FastAPI(title='YOLO Workspace Studio', docs_url=None, redoc_url=None)
@@ -841,7 +842,7 @@ def perform_dataset_import(wid, data, user, update):
         require_workspace(db, user, wid, 'manager')
         update(stage='validating', message='Đang kiểm tra đường dẫn và quyền truy cập')
         mode = data.import_mode.strip().lower()
-        valid_modes = {'same_folder', 'labeled', 'images', 'split', 'separate'}
+        valid_modes = {'auto', 'same_folder', 'labeled', 'images', 'split', 'separate'}
         if mode not in valid_modes:
             fail(422, 'Loai import khong hop le')
         if mode == 'separate':
@@ -871,9 +872,9 @@ def perform_dataset_import(wid, data, user, update):
             fail(403, 'Admin can dat YOLO_ALLOWED_ROOTS de manager import dataset')
         if not os.access(image_dir, os.R_OK) or not os.access(label_dir, os.R_OK):
             fail(403, 'Server khong co quyen doc thu muc anh hoac nhan')
-        if mode == 'images' and root.name.lower() == 'images':
+        if mode in ('images', 'auto') and root.name.lower() == 'images':
             root = root.parent
-        elif (mode == 'images' and root.parent.name.lower() == 'images'
+        elif (mode in ('images', 'auto') and root.parent.name.lower() == 'images'
               and root.name.lower() in ('train', 'val', 'valid', 'test')):
             root = root.parent.parent
         try:
@@ -1946,6 +1947,16 @@ def distribute_assignments(pid: int, data: AssignmentData, request: Request):
         user = require_user(request, db)
         project, _ = project_access(db, user, pid, 'manager')
         member_ids = list(dict.fromkeys(data.member_ids))
+        percentages = data.percentages
+        if percentages is not None:
+            import math
+            if (len(member_ids) != len(data.member_ids) or len(percentages) != len(member_ids)
+                    or any(not math.isfinite(v) or v <= 0 or v > 100 for v in percentages)
+                    or abs(sum(percentages) - 100) > .001):
+                fail(422, 'Tỷ lệ phải lớn hơn 0 và tổng bằng 100% cho các thành viên đã chọn')
+        else:
+            percentages = [100 / len(member_ids)] * len(member_ids)
+        db.execute('BEGIN IMMEDIATE')
         placeholders = ','.join('?' for _ in member_ids)
         members = db.execute(
             f'''SELECT user_id FROM members WHERE workspace_id=?
@@ -1965,11 +1976,18 @@ def distribute_assignments(pid: int, data: AssignmentData, request: Request):
         if data.only_unassigned:
             cond += ' AND assigned_to IS NULL'
         rows = db.execute(f'SELECT id FROM assets WHERE {cond} ORDER BY image_rel', vals).fetchall()
-        counts = {member_id: 0 for member_id in member_ids}
-        for index, row in enumerate(rows):
-            member_id = member_ids[index % len(member_ids)]
-            db.execute('UPDATE assets SET assigned_to=? WHERE id=?', (member_id, row['id']))
-            counts[member_id] += 1
+        # Largest remainders keep every image assigned, including small datasets.
+        quotas = [len(rows) * value / sum(percentages) for value in percentages]
+        sizes = [int(value) for value in quotas]
+        remainder = len(rows) - sum(sizes)
+        for index in sorted(range(len(sizes)), key=lambda i: (-(quotas[i] - sizes[i]), i))[:remainder]:
+            sizes[index] += 1
+        counts = dict(zip(member_ids, sizes))
+        offset = 0
+        for member_id, size in zip(member_ids, sizes):
+            db.executemany('UPDATE assets SET assigned_to=? WHERE id=?',
+                           [(member_id, row['id']) for row in rows[offset:offset + size]])
+            offset += size
         db.commit()
         return {'ok': True, 'assigned': len(rows), 'counts': counts}
 

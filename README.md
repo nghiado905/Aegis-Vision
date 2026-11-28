@@ -33,6 +33,16 @@ If teammates access via another computer, the dataset path is an **absolute path
 
 ## 2. Review workflow
 
+The default import mode automatically pairs existing YOLO `.txt` labels beside
+images or under the matching `labels/` directory. You can select the dataset
+root, `images/`, or `images/train/`. Images without labels are also imported.
+Class names are read from the dataset metadata (`data.yaml` or `classes.txt`).
+
+Managers can use **Phân chia ảnh theo tỷ lệ** to select annotators and set their
+percentages (total 100%). Remaining images from rounding are assigned to keep
+the total exact. Uncheck **Chỉ chia ảnh chưa được phân công** to redistribute
+previously assigned images within the selected split and review status.
+
 ### Import dataset with progress
 
 The Import dataset dialog supports same-folder images and labels, separate image

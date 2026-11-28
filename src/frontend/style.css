@@ -1464,3 +1464,31 @@ button[data-action="completeAsset"]:hover:not(:disabled) {
   color: var(--rose) !important;
   transform: scale(1.2);
 }
+
+/* Compact form controls and assignment rows. */
+.modal input[type="checkbox"], .modal input[type="radio"] { width:16px; height:16px; padding:0; flex:0 0 16px; accent-color:var(--accent); }
+.assignment-list { max-height:280px; overflow:auto; display:grid; gap:6px; }
+.assignment-row { display:flex; align-items:center; gap:12px; padding:8px 10px; border:1px solid var(--border2); border-radius:var(--radius-sm); }
+.modal .assignment-member { display:flex; align-items:center; gap:9px; flex:1; min-width:0; margin:0; cursor:pointer; }
+.assignment-member span { min-width:0; overflow-wrap:anywhere; }
+.assignment-member small { display:block; color:var(--muted); font-size:11px; margin-top:3px; }
+.modal .assignment-percent { display:flex; align-items:center; gap:5px; margin:0; flex:0 0 100px; }
+.assignment-percent input { min-width:0; padding:6px 8px; }
+.assignment-summary { margin:10px 0; gap:8px; font-size:12px; flex-wrap:wrap; }
+.modal .assignment-check { display:flex; align-items:center; gap:8px; }
+.modal { padding:20px; border-radius:16px; }
+.modal label { margin-top:10px; }
+.modal input:not([type="checkbox"]):not([type="radio"]):not([type="color"]), .modal select { padding:8px 10px; }
+.project-view-container .stats { gap:12px; }
+.project-view-container .stat-card { padding:14px 16px; }
+.project-view-container .stat-value { font-size:28px; }
+.project-header-card, .filterbar-card { padding:16px; }
+.project-view-container .asset-grid { grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr)); gap:12px; }
+.asset-foot { padding:8px 10px; }
+.project-card-foot { flex-wrap:wrap; gap:8px; }
+.project-labels { min-width:0; flex-wrap:wrap; }
+@media (max-width:600px) {
+  .modal { padding:16px; }
+  .project-actions-toolbar { width:100%; gap:6px; }
+  .filterbar-card select.field { max-width:100%; }
+}

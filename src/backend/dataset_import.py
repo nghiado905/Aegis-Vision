@@ -30,7 +30,16 @@ def collect_assets(root, image_dir, label_dir, mode, extensions, update):
             if file.suffix.lower() not in extensions or not file.resolve().is_relative_to(image_dir):
                 continue
             relative = file.relative_to(image_dir)
-            if mode == 'separate':
+            if mode == 'auto':
+                parts = list(file.relative_to(root).parts)
+                positions = [i for i, part in enumerate(parts[:-1]) if part.lower() == 'images']
+                candidates = []
+                if positions:
+                    parts[positions[-1]] = 'labels'
+                    candidates.append(root / Path(*parts).with_suffix('.txt'))
+                candidates.extend([file.with_suffix('.txt'), root / 'labels' / relative.with_suffix('.txt')])
+                label = next((p for p in candidates if p.is_file()), candidates[0])
+            elif mode == 'separate':
                 label = label_dir / relative.with_suffix('.txt')
             elif mode == 'same_folder':
                 label = file.with_suffix('.txt')

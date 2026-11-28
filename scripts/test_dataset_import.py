@@ -61,6 +61,49 @@ class DatasetImportTests(unittest.TestCase):
             time.sleep(.02)
         self.fail('Import did not finish')
 
+    def test_auto_detects_labels_from_dataset_and_images_directory(self):
+        self.image(self.root/'images'/'train'/'a.jpg')
+        self.label(self.root/'labels'/'train'/'a.txt')
+        (self.root/'classes.txt').write_text('normal\nsleep\n', encoding='utf-8')
+        for path in (self.root, self.root/'images', self.root/'images'/'train'):
+            state, _ = self.job(dict(import_mode='auto', dataset_path=str(path)))
+            self.assertEqual(state['status'], 'completed', state)
+            self.assertEqual(state['paired'], 1)
+            self.assertEqual(state['result']['classes'], ['normal', 'sleep'])
+
+    def test_auto_mixed_same_folder_and_unlabeled(self):
+        self.image(self.root/'a.jpg')
+        self.label(self.root/'a.txt')
+        self.image(self.root/'b.jpg')
+        state, _ = self.job(dict(import_mode='auto', dataset_path=str(self.root)))
+        self.assertEqual(state['status'], 'completed', state)
+        self.assertEqual((state['paired'], state['missing']), (1, 1))
+
+    def test_assignments_ratio_rounding_and_redistribution(self):
+        for i in range(7):
+            self.image(self.root/f'{i}.jpg')
+        state, _ = self.job(dict(import_mode='auto', dataset_path=str(self.root)))
+        pid = state['result']['id']
+        with backend.db_connect() as db:
+            ids = []
+            for i in range(2):
+                uid = db.execute('INSERT INTO users(username,display_name,password_hash,created_at) VALUES(?,?,?,?)',
+                                 (f'{self.root.name}-{i}', f'Editor {i}', 'unused', backend.now())).lastrowid
+                db.execute('INSERT INTO members(workspace_id,user_id,role) VALUES(?,?,?)', (self.wid, uid, 'editor'))
+                ids.append(uid)
+        url = f'/api/projects/{pid}/assignments/distribute'
+        payload = dict(member_ids=ids, percentages=[70, 30])
+        response = self.client.post(url, json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['counts'], {str(ids[0]): 5, str(ids[1]): 2})
+        self.assertEqual(self.client.post(url, json=payload).json()['assigned'], 0)
+        response = self.client.post(url, json={**payload, 'percentages': [30, 70], 'only_unassigned': False})
+        self.assertEqual(response.json()['counts'], {str(ids[0]): 2, str(ids[1]): 5})
+        self.assertEqual(self.client.post(url, json={**payload, 'percentages': [30, 30]}).status_code, 422)
+        with backend.db_connect() as db:
+            counts = dict(db.execute('SELECT assigned_to,COUNT(*) FROM assets WHERE project_id=? GROUP BY assigned_to', (pid,)).fetchall())
+        self.assertEqual(counts, {ids[0]: 2, ids[1]: 5})
+
     def test_separate_paths_and_class_names(self):
         images, labels = self.root/'photos', self.root/'annotations'
         for sub in ('one', 'two'):
